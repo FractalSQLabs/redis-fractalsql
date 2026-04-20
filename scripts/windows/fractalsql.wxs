@@ -1,0 +1,229 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  scripts/windows/fractalsql.wxs — WiX Toolset source for the
+  FractalSQL Redis module MSI for Memurai (Windows).
+
+  Driven by five preprocessor vars supplied by build-msi.bat:
+    -dMEMURAI_MAJOR=4                      (numeric, for display)
+    -dMEMURAI_MAJOR_TAG=4                  (sanitized, for WiX IDs)
+    -dMEMURAI_MAJOR_HEX=0004               (4 hex chars, for GUIDs)
+    -dSTAGE_DIR=dist\windows\staging-...
+    -dMSI_VERSION=1.0.0
+  plus the standard candle -arch x64, which populates
+  $(sys.BUILDARCH) and selects the Package Platform attribute.
+
+  UX flow
+    1. Welcome / EULA (bundled LICENSE).
+    2. WixUI_InstallDir lets the user pick the Memurai install root
+       (default: C:\Program Files\Memurai, or whatever the Memurai
+       installer registered at HKLM\SOFTWARE\Memurai\InstallPath).
+       This must be the folder that Memurai's own installer created
+       — i.e. the folder containing memurai.conf and the existing
+       modules\ subdirectory ^(or where we should create one^).
+    3. Install copies fractalsql.dll into modules\ and the doc /
+       license files into share\doc\redis-fractalsql\.
+    4. If ADDLOADMODULE=1 ^(default^), a deferred Custom Action
+       idempotently appends a loadmodule directive to memurai.conf.
+       ADDLOADMODULE=0 on the msiexec command line skips it. The
+       Memurai service is NOT restarted by the installer — that is
+       the operator's call.
+    5. Uninstall removes every file cleanly; the memurai.conf line
+       is left in place ^(removing it requires editing a file we
+       don't own^).
+
+  Per-Memurai-major UpgradeCode
+    Each Memurai major gets its own UpgradeCode so future majors
+    can coexist or major-upgrade independently. ProductId=* forces
+    a fresh ProductCode per build, so re-installing the same MSI
+    overwrites cleanly.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+
+  <?if $(var.MEMURAI_MAJOR_HEX) = "0003" ?>
+      <?define UpgradeCode = "C7F9B2E0-3A10-4C02-9DA3-CE01AA5FB001" ?>
+  <?elseif $(var.MEMURAI_MAJOR_HEX) = "0004" ?>
+      <?define UpgradeCode = "C7F9B2E0-3A10-4C02-9DA3-CE01AA5FB002" ?>
+  <?elseif $(var.MEMURAI_MAJOR_HEX) = "0005" ?>
+      <?define UpgradeCode = "C7F9B2E0-3A10-4C02-9DA3-CE01AA5FB003" ?>
+  <?else ?>
+      <?error Unsupported MEMURAI_MAJOR_HEX: $(var.MEMURAI_MAJOR_HEX) ?>
+  <?endif ?>
+
+  <Product Id="*"
+           Name="FractalSQL for Memurai $(var.MEMURAI_MAJOR)"
+           Language="1033"
+           Version="$(var.MSI_VERSION)"
+           Manufacturer="FractalSQLabs"
+           UpgradeCode="$(var.UpgradeCode)">
+
+    <Package InstallerVersion="300"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Platform="$(sys.BUILDARCH)"
+             Description="FractalSQL Redis module installer for Memurai $(var.MEMURAI_MAJOR)"
+             Manufacturer="FractalSQLabs" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of FractalSQL for Memurai $(var.MEMURAI_MAJOR) is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <?if $(sys.BUILDARCH) = "x86" ?>
+        <?error Memurai does not publish a 32-bit Windows build ^(no host server for a 32-bit module DLL^). ?>
+    <?endif ?>
+    <?if $(sys.BUILDARCH) = "arm64" ?>
+        <?error Memurai does not yet publish Windows ARM64 ^(no host server binary available^). ?>
+    <?endif ?>
+
+    <!-- WixUI_InstallDir targets MEMURAIROOT — the Memurai install
+         root folder. Passing MEMURAIROOT=D:\Memurai on the msiexec
+         command line overrides it (Public Property with the same Id
+         as a Directory is honored by the MSI engine at cost time).
+         PLUGINDIR is exposed separately for scripted installs that
+         want to point the DLL at an even more unusual location. -->
+    <Property Id="WIXUI_INSTALLDIR" Value="MEMURAIROOT" />
+
+    <!-- Auto-detect the Memurai install path from its own registry
+         footprint. The fallback default is C:\Program Files\Memurai,
+         which matches Memurai's stock installer. If your Memurai
+         installation registered a different key, pass MEMURAIROOT
+         explicitly on the msiexec command line. -->
+    <Property Id="MEMURAI_DETECTED_PATH">
+      <RegistrySearch Id="FindMemuraiInstallPath"
+                      Root="HKLM"
+                      Key="SOFTWARE\Memurai"
+                      Name="InstallPath"
+                      Type="raw" />
+    </Property>
+    <SetDirectory Id="MEMURAIROOT"
+                  Value="[MEMURAI_DETECTED_PATH]"
+                  Sequence="both">MEMURAI_DETECTED_PATH</SetDirectory>
+
+    <!-- ADDLOADMODULE: 1 = append the loadmodule directive to
+         memurai.conf (default). 0 = skip. Override on silent installs
+         via msiexec /qn ADDLOADMODULE=0. -->
+    <Property Id="ADDLOADMODULE" Value="1" />
+
+    <!--
+         Directory layout mirrors Memurai's default Windows install:
+           C:\Program Files\Memurai\
+             modules\              fractalsql.dll
+             share\
+               doc\
+                 redis-fractalsql\ LICENSE
+                                   LICENSE-THIRD-PARTY
+                                   README.txt
+                                   load_module.conf
+    -->
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="MEMURAIROOT" Name="Memurai">
+          <Directory Id="PLUGINDIR" Name="modules" />
+          <Directory Id="ShareDir" Name="share">
+            <Directory Id="DocDir" Name="doc">
+              <Directory Id="FractalSqlDocDir" Name="redis-fractalsql" />
+            </Directory>
+          </Directory>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <!-- Each file is its own Component so uninstall removes exactly
+         the set we installed — no orphan files, no touching existing
+         Memurai files. GUIDs embed MEMURAI_MAJOR_HEX so each
+         (major, file) pair is deterministic across rebuilds without
+         colliding across majors. -->
+
+    <ComponentGroup Id="CoreFiles">
+
+      <Component Id="c_FractalSqlDll"
+                 Directory="PLUGINDIR"
+                 Guid="F$(var.MEMURAI_MAJOR_HEX)001-0000-4000-B000-00000000DA01">
+        <File Id="fractalsql.dll"
+              Source="$(var.STAGE_DIR)\fractalsql.dll"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_License"
+                 Directory="FractalSqlDocDir"
+                 Guid="F$(var.MEMURAI_MAJOR_HEX)002-0000-4000-B000-0000000011CE">
+        <File Id="LICENSE.txt"
+              Name="LICENSE"
+              Source="$(var.STAGE_DIR)\LICENSE"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_LicenseThirdParty"
+                 Directory="FractalSqlDocDir"
+                 Guid="F$(var.MEMURAI_MAJOR_HEX)003-0000-4000-B000-00000003DA7A">
+        <File Id="LICENSE_THIRD_PARTY.txt"
+              Name="LICENSE-THIRD-PARTY"
+              Source="$(var.STAGE_DIR)\LICENSE-THIRD-PARTY"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_Readme"
+                 Directory="FractalSqlDocDir"
+                 Guid="F$(var.MEMURAI_MAJOR_HEX)004-0000-4000-B000-00000000AD11">
+        <File Id="README.txt"
+              Source="$(var.STAGE_DIR)\README.txt"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="c_LoadModuleConf"
+                 Directory="FractalSqlDocDir"
+                 Guid="F$(var.MEMURAI_MAJOR_HEX)005-0000-4000-B000-00000000C0F1">
+        <File Id="load_module.conf"
+              Source="$(var.STAGE_DIR)\load_module.conf"
+              KeyPath="yes" />
+      </Component>
+
+    </ComponentGroup>
+
+    <Feature Id="MainFeature"
+             Title="FractalSQL for Memurai $(var.MEMURAI_MAJOR)"
+             Level="1"
+             Display="expand"
+             AllowAdvertise="no">
+      <ComponentGroupRef Id="CoreFiles" />
+    </Feature>
+
+    <!-- Optional loadmodule append.
+
+         WiX deferred CAs can only access the single built-in
+         CustomActionData property (named with the deferred CA's Id).
+         Pattern: an immediate CA resolves [MEMURAIROOT] into the
+         command line and stores it in the property whose name equals
+         the deferred CA's Id. The deferred CA ^(WixQuietExec^) then
+         picks it up and runs it elevated.
+
+         The cmd-line logic is idempotent: findstr first, echo only
+         if the exact line is absent. Return="ignore" so a failed
+         append (read-only memurai.conf, etc.) doesn't block the
+         install. -->
+    <CustomAction Id="SetAppendLoadmodule"
+                  Property="AppendLoadmodule"
+                  Value='"[SystemFolder]cmd.exe" /d /c "(findstr /L /C:&quot;loadmodule \&quot;[MEMURAIROOT]modules\fractalsql.dll\&quot;&quot; &quot;[MEMURAIROOT]memurai.conf&quot; 1&gt;nul 2&gt;nul) || (echo loadmodule &quot;[MEMURAIROOT]modules\fractalsql.dll&quot;&gt;&gt;&quot;[MEMURAIROOT]memurai.conf&quot;)"'
+                  Execute="immediate" />
+
+    <CustomAction Id="AppendLoadmodule"
+                  BinaryKey="WixCA"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Return="ignore"
+                  Impersonate="no" />
+
+    <InstallExecuteSequence>
+      <Custom Action="SetAppendLoadmodule"
+              After="InstallFiles">ADDLOADMODULE="1" AND NOT Installed</Custom>
+      <Custom Action="AppendLoadmodule"
+              After="SetAppendLoadmodule">ADDLOADMODULE="1" AND NOT Installed</Custom>
+    </InstallExecuteSequence>
+
+    <!-- Standard WixUI_InstallDir flow (Welcome -> EULA -> FolderDlg
+         -> Ready -> Progress). Folder picker lets power-users retarget
+         a non-default Memurai install root. -->
+    <UIRef Id="WixUI_InstallDir" />
+    <UIRef Id="WixUI_ErrorProgressText" />
+
+  </Product>
+</Wix>

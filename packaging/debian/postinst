@@ -1,0 +1,49 @@
+#!/bin/sh
+# packaging/debian/postinst
+#
+# Prints a usage hint right after `apt install` so operators know how
+# to enable the module.
+
+set -e
+
+case "$1" in
+    configure)
+        cat <<'EOF'
+
+redis-fractalsql installed.
+
+The module is at:
+    /usr/lib/redis/modules/fractalsql.so
+
+Enable it one of two ways:
+
+  1) Add this line to /etc/redis/redis.conf:
+
+         loadmodule /usr/lib/redis/modules/fractalsql.so
+
+     Or include the shipped snippet:
+
+         include /etc/redis/modules-available/fractalsql.conf
+
+     Then restart:
+
+         sudo systemctl restart redis-server
+
+  2) Live-load it on a running server (does NOT persist across restarts):
+
+         redis-cli MODULE LOAD /usr/lib/redis/modules/fractalsql.so
+
+Verify:
+
+    redis-cli MODULE LIST
+    redis-cli FRACTALSQL.EDITION
+    redis-cli FRACTALSQL.VERSION
+    redis-cli COMMAND INFO FRACTAL.SEARCH
+
+EOF
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+esac
+
+exit 0

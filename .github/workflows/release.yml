@@ -1,0 +1,392 @@
+name: Release redis-fractalsql Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  # ------------------------------------------------------------------
+  # Linux: build fractalsql.so per arch. The Redis Modules ABI
+  # (REDISMODULE_APIVER_1) has been stable since Redis 4.0, so one
+  # .so per arch covers 6.2 / 7.0 / 7.2 / 7.4 (and 8.x).
+  #
+  # amd64 gets a native smoke test that loads the SAME .so into
+  # redis:6.2, redis:7.0, redis:7.2, and redis:7.4 containers and
+  # verifies FRACTALSQL.EDITION / FRACTALSQL.VERSION plus a
+  # cosine-similarity convergence check — one binary, every major,
+  # which is the actual cross-major-ABI proof.
+  # arm64 skips the smoke test — QEMU + redis-server works but adds
+  # flake; the Dockerfile's post-link assertions already validate the
+  # arm64 ABI (ldd shortlist, .dynsym entry point, size ceiling).
+  # ------------------------------------------------------------------
+  build:
+    name: build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build fractalsql.so for ${{ matrix.arch }}
+        run: |
+          chmod +x build.sh
+          ./build.sh ${{ matrix.arch }}
+          ls -l dist/${{ matrix.arch }}/fractalsql.so
+
+      - name: Smoke test (edition/version + FRACTAL.SEARCH convergence)
+        if: matrix.arch == 'amd64'
+        run: |
+          set -euo pipefail
+          SO="$(pwd)/dist/amd64/fractalsql.so"
+
+          # Validate the same fractalsql.so against every supported
+          # Redis major — 6.2 / 7.0 / 7.2 / 7.4. One binary in, four
+          # containers out, which proves the cross-major ABI claim
+          # rather than just asserting it in commentary.
+          #
+          # Each cell runs the container with -p, so the host can
+          # drive it via both docker exec (simple string commands)
+          # and a Python RESP client (for the binary-blob corpus /
+          # query and the nested map reply from FRACTAL.SEARCH).
+          for TAG in 6.2 7.0 7.2 7.4; do
+              C="redis-${TAG}"
+              HOST_PORT=$((46379 + $(echo "${TAG}" | tr -d .)))
+              echo "=============================================="
+              echo "  Smoke test against redis:${TAG} (host port ${HOST_PORT})"
+              echo "=============================================="
+
+              docker run -d --name "${C}" \
+                  -v "${SO}:/modules/fractalsql.so:ro" \
+                  -p "${HOST_PORT}:6379" \
+                  "redis:${TAG}" \
+                  redis-server --loadmodule /modules/fractalsql.so
+
+              # redis:X images start accepting on :6379 immediately —
+              # no password, no two-phase bootstrap. A simple PING
+              # loop is enough to prove readiness.
+              for i in $(seq 1 30); do
+                  if docker exec "${C}" redis-cli PING 2>/dev/null \
+                       | grep -q PONG; then
+                      break
+                  fi
+                  sleep 1
+              done
+              docker exec "${C}" redis-cli PING | grep -q PONG
+
+              docker exec "${C}" redis-cli MODULE LIST | tee /tmp/mods
+              grep -q fractalsql /tmp/mods
+
+              EDITION=$(docker exec "${C}" redis-cli FRACTALSQL.EDITION)
+              echo "[${TAG}] edition: ${EDITION}"
+              test "${EDITION}" = "Community"
+
+              VERSION=$(docker exec "${C}" redis-cli FRACTALSQL.VERSION)
+              echo "[${TAG}] version: ${VERSION}"
+              test "${VERSION}" = "1.0.0"
+
+              # Convergence check. query = (0.6, 0.8). Cosine distance
+              # is magnitude-invariant — every point on the ray through
+              # the origin and (0.6, 0.8) is a global optimum, so the
+              # coordinates SFS returns can land anywhere on that ray
+              # in [-1, 1]^2. We assert the invariant the optimizer is
+              # actually minimizing: cosine similarity to the query
+              # should be essentially 1. ||query||^2 = 0.6^2+0.8^2=1,
+              # so cos_sim simplifies to (v . query) / ||v||.
+              #
+              # Redis's RESP3 map reply is hard to parse from bash, so
+              # drive the container from the host with a tiny Python
+              # RESP client over the mapped port. Python stdlib only —
+              # the runner has python3, and a raw socket is simpler
+              # to audit than pip-installing redis-py.
+              python3 scripts/ci/smoke_convergence.py "${HOST_PORT}" "${TAG}"
+
+              docker rm -f "${C}"
+          done
+          echo "smoke test passed on redis 6.2 / 7.0 / 7.2 / 7.4"
+
+      - name: Upload .so artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: redis-fractalsql-${{ matrix.arch }}-so
+          path: dist/${{ matrix.arch }}/fractalsql.so
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # One packaging cell per arch. Pulls the per-arch .so from the
+  # build job, runs scripts/package.sh to produce .deb + .rpm, and
+  # verifies no luajit runtime dep leaked into the package metadata.
+  # ------------------------------------------------------------------
+  package:
+    name: package ${{ matrix.arch }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download fractalsql.so
+        uses: actions/download-artifact@v4
+        with:
+          name: redis-fractalsql-${{ matrix.arch }}-so
+          path: dist/${{ matrix.arch }}
+
+      - name: Install Packaging Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm
+          sudo gem install --no-document fpm
+
+      - name: Build .deb and .rpm for ${{ matrix.arch }}
+        run: |
+          chmod +x scripts/package.sh
+          scripts/package.sh ${{ matrix.arch }}
+          ls -l dist/packages
+
+      - name: Verify packages declare no luajit dependency
+        run: |
+          set -euo pipefail
+          for deb in dist/packages/*-${{ matrix.arch }}.deb; do
+              echo "=== ${deb} ==="
+              DEPS=$(dpkg-deb -f "${deb}" Depends)
+              echo "Depends: ${DEPS}"
+              if echo "${DEPS}" | grep -iE 'luajit'; then
+                  echo "FAIL: ${deb} declares a luajit dependency" >&2
+                  exit 1
+              fi
+          done
+          for rpm in dist/packages/*-${{ matrix.arch }}.rpm; do
+              echo "=== ${rpm} ==="
+              REQS=$(rpm -qpR "${rpm}" || true)
+              echo "Requires:"
+              echo "${REQS}"
+              if echo "${REQS}" | grep -iE '^luajit'; then
+                  echo "FAIL: ${rpm} declares a luajit requirement" >&2
+                  exit 1
+              fi
+          done
+
+      - name: Verify packages ship LICENSE files
+        run: |
+          set -euo pipefail
+          for deb in dist/packages/*-${{ matrix.arch }}.deb; do
+              echo "=== ${deb} ==="
+              CONTENTS=$(dpkg-deb -c "${deb}")
+              echo "${CONTENTS}" | grep -E 'usr/share/doc/redis-fractalsql/LICENSE$'
+              echo "${CONTENTS}" | grep -E 'usr/share/doc/redis-fractalsql/LICENSE-THIRD-PARTY$'
+          done
+          for rpm in dist/packages/*-${{ matrix.arch }}.rpm; do
+              echo "=== ${rpm} ==="
+              CONTENTS=$(rpm -qlp "${rpm}")
+              echo "${CONTENTS}" | grep -E '/usr/share/doc/redis-fractalsql/LICENSE$'
+              echo "${CONTENTS}" | grep -E '/usr/share/doc/redis-fractalsql/LICENSE-THIRD-PARTY$'
+          done
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: redis-fractalsql-${{ matrix.arch }}
+          path: dist/packages/*
+          if-no-files-found: error
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/packages/*
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ------------------------------------------------------------------
+  # Windows: fractalsql.dll + FractalSQL-Memurai-<MAJOR>-<VER>-x64.msi
+  #
+  # Matrix — x64 only.
+  #   Memurai 4.x : Redis 7.2-compatible. The one live, publicly
+  #                 downloadable Memurai major at release time.
+  #   x86         : Memurai does not publish a 32-bit build.
+  #   arm64       : Memurai does not yet publish Windows ARM64 —
+  #                 defer per brief ("defer rather than half-
+  #                 implement") until memurai.com advertises one.
+  #
+  # No Windows smoke test in CI: Memurai Developer download requires
+  # a form submission on memurai.com and license acceptance, which
+  # can't clean-room automate in a public GitHub Actions workflow.
+  # We validate the DLL posture (dumpbin /dependents + /exports) and
+  # rely on the Linux smoke test for ABI coverage.
+  # ------------------------------------------------------------------
+  build-windows-msi:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - memurai_major: "4"
+            arch: x64
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    name: windows memurai${{ matrix.memurai_major }} / ${{ matrix.arch }}
+    env:
+      REDIS_GIT_URL: https://github.com/redis/redis.git
+      REDIS_GIT_REF: "7.4.1"
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC dev cmd (${{ matrix.arch }})
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Install WiX Toolset (provides candle.exe + light.exe)
+        shell: pwsh
+        run: |
+          choco install -y --no-progress wixtoolset
+
+          # Locate the WiX bin dir and prepend to PATH. Covers both
+          # the standard choco shim location and future ARM64 runners
+          # where the shim path may differ.
+          $wixBin = $null
+          $candidates = @(
+            "C:\Program Files (x86)\WiX Toolset v3.14\bin",
+            "C:\Program Files\WiX Toolset v3.14\bin",
+            "C:\Program Files (x86)\WiX Toolset v3.11\bin"
+          )
+          foreach ($c in $candidates) {
+            if (Test-Path (Join-Path $c "candle.exe")) { $wixBin = $c; break }
+          }
+          if (-not $wixBin) {
+            Write-Host "Searching under Program Files for candle.exe..."
+            $hit = Get-ChildItem -Path "C:\Program Files (x86)", "C:\Program Files" `
+                     -Recurse -Filter "candle.exe" -ErrorAction SilentlyContinue `
+                   | Select-Object -First 1
+            if ($hit) { $wixBin = $hit.DirectoryName }
+          }
+          if (-not $wixBin) {
+            Write-Host "FATAL: candle.exe not found after choco install wixtoolset"
+            exit 1
+          }
+          Write-Host "WiX bin dir: $wixBin"
+          Add-Content -Path $env:GITHUB_PATH -Value $wixBin
+
+      - name: Clone + build static LuaJIT 2.1 with MSVC
+        shell: cmd
+        run: |
+          if not exist deps mkdir deps
+          git clone --depth 1 --branch v2.1 https://github.com/LuaJIT/LuaJIT.git deps\LuaJIT
+          cd deps\LuaJIT\src
+          call msvcbuild.bat static
+          if not exist lua51.lib (
+            echo ==^> LuaJIT static build failed
+            exit /b 1
+          )
+          dir lua51.lib lua.h
+
+      - name: Fetch redismodule.h from pinned Redis tag
+        shell: pwsh
+        env:
+          REDIS_VER: ${{ env.REDIS_GIT_REF }}
+        run: |
+          New-Item -ItemType Directory -Force -Path deps\redis | Out-Null
+          git clone --depth 1 --branch $env:REDIS_VER `
+              $env:REDIS_GIT_URL deps\redis\src-tree
+          $src = "deps\redis\src-tree\src\redismodule.h"
+          if (-not (Test-Path $src)) {
+              Write-Host "FATAL: $src missing in pinned Redis tree"
+              exit 1
+          }
+          Copy-Item $src "include\redismodule.h" -Force
+          Write-Host "Staged include\redismodule.h from Redis $env:REDIS_VER"
+
+      - name: Build fractalsql.dll (/MT static CRT, /GL WPO)
+        shell: cmd
+        env:
+          MEMURAI_MAJOR: ${{ matrix.memurai_major }}
+        run: |
+          set LUAJIT_DIR=%CD%\deps\LuaJIT\src
+          set OUT_DIR=%CD%\dist\windows\memurai%MEMURAI_MAJOR%
+          if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
+          call scripts\windows\build.bat
+          if errorlevel 1 exit /b 1
+          dir "%OUT_DIR%\fractalsql.dll"
+
+      - name: Smoke-check fractalsql.dll dependencies (dumpbin)
+        shell: pwsh
+        env:
+          MEMURAI_MAJOR: ${{ matrix.memurai_major }}
+        run: |
+          $dll = "dist\windows\memurai${env:MEMURAI_MAJOR}\fractalsql.dll"
+          $deps = dumpbin /dependents $dll
+          Write-Host ($deps -join "`n")
+          if ($deps -match 'vcruntime|msvcp140|msvcr\d') {
+              Write-Host '==> FAIL: .dll depends on MSVC redistributable DLLs'
+              exit 1
+          }
+          if ($deps -match 'lua51\.dll|libluajit') {
+              Write-Host '==> FAIL: .dll depends on a dynamic LuaJIT'
+              exit 1
+          }
+          Write-Host '==> OK: static CRT + static LuaJIT posture'
+
+      - name: Verify RedisModule_OnLoad exported (dumpbin /exports)
+        shell: pwsh
+        env:
+          MEMURAI_MAJOR: ${{ matrix.memurai_major }}
+        run: |
+          $dll = "dist\windows\memurai${env:MEMURAI_MAJOR}\fractalsql.dll"
+          $exports = dumpbin /exports $dll
+          Write-Host ($exports -join "`n")
+          if (-not ($exports -match '\bRedisModule_OnLoad\b')) {
+              Write-Host '==> FAIL: RedisModule_OnLoad missing from export table'
+              exit 1
+          }
+          Write-Host '==> OK: RedisModule_OnLoad exported'
+
+      - name: Build MSI (candle + light, Memurai ${{ matrix.memurai_major }} / ${{ matrix.arch }})
+        shell: cmd
+        env:
+          MEMURAI_MAJOR: ${{ matrix.memurai_major }}
+          MSI_ARCH:      ${{ matrix.arch }}
+        run: |
+          call scripts\windows\build-msi.bat
+          if errorlevel 1 exit /b 1
+          dir dist\windows\*.msi
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: redis-fractalsql-windows-memurai${{ matrix.memurai_major }}-${{ matrix.arch }}
+          path: dist/windows/FractalSQL-Memurai-${{ matrix.memurai_major }}-*-${{ matrix.arch }}.msi
+          if-no-files-found: error
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/windows/FractalSQL-Memurai-${{ matrix.memurai_major }}-*-${{ matrix.arch }}.msi
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

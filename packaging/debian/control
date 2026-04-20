@@ -1,0 +1,35 @@
+Source: redis-fractalsql
+Section: database
+Priority: optional
+Maintainer: FractalSQLabs <ops@fractalsqlabs.io>
+Build-Depends:
+ debhelper-compat (= 13),
+ pkg-config,
+ curl,
+ git,
+ ca-certificates
+Standards-Version: 4.6.2
+Homepage: https://github.com/FractalSQLabs/redis-fractalsql
+
+Package: redis-fractalsql
+Architecture: amd64 arm64
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ libc6 (>= 2.38),
+ redis-server
+Description: Stochastic Fractal Search module for Redis
+ redis-fractalsql is a native C module for Redis 6.2 / 7.0 / 7.2 /
+ 7.4 (ABI-compatible with 8.x) that exposes a FRACTAL.SEARCH command
+ backed by a LuaJIT-compiled Stochastic Fractal Search optimizer.
+ The command is flagged readonly / fast / allow-stale. LuaJIT is
+ statically linked into the module; the only runtime dependency is
+ glibc.
+ .
+ After installation, enable the module by adding the following line
+ to redis.conf (the post-install script prints this):
+ .
+     loadmodule /usr/lib/redis/modules/fractalsql.so
+ .
+ An example config snippet is installed at
+ /etc/redis/modules-available/fractalsql.conf.

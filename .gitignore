@@ -1,0 +1,38 @@
+# Build artifacts
+*.so
+*.o
+*.a
+fractalsql.so
+
+# NOTE: include/sfs_core_bc.h is a tracked source file
+# (pre-compiled LuaJIT bytecode). Do not add it to this list.
+
+# redismodule.h is fetched from upstream Redis at build time (see
+# Makefile and docker/Dockerfile). Not a checked-in vendor copy.
+include/redismodule.h
+
+# Build output trees
+dist/
+
+# Packaging temp files (fpm + debhelper + rpmbuild stagedirs)
+*.deb
+*.rpm
+packaging/debian/.debhelper/
+packaging/debian/redis-fractalsql/
+packaging/debian/files
+packaging/debian/*.log
+packaging/debian/*.substvars
+packaging/rpm/BUILD/
+packaging/rpm/BUILDROOT/
+packaging/rpm/RPMS/
+packaging/rpm/SOURCES/
+packaging/rpm/SPECS/
+packaging/rpm/SRPMS/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
